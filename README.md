@@ -11,26 +11,31 @@ reconstruction.
 ---
 
 ## Training
-[Training Vision Transformer Model on Gaussian Data]()
-[Finetuning Vision Transformer on Flamingo Data]()
-[Loss Curves]()
+* [Training Vision Transformer Model on Gaussian Data]()
+* [Finetuning Vision Transformer on Flamingo Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/finetuning_vision_transformer_on_flamingo_data.py)
+* [Loss Curves](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/loss_curves.py)
 
 ## Results
-[Final Plots]()
+* [Final Plots](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/final_plots.py)
 
 ## Analysis
-[Quadratic Estimator Performance on Gaussian Data]()
-[Quadratic Estimator Performance on Flamingo Data]()
-[Vision Transformer without Finetuning on Gaussian Data]()
-[Vision Transformer without Finetuning on Flamingo Data]()
-[Vision Transformer with Finetuning on Flamingo Data]()
+* [Quadratic Estimator Performance on Gaussian Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/quadratic_estimator_performance_on_gaussian_data.py)
+* [Quadratic Estimator Performance on Flamingo Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/quadratic_estimator_performance_on_flamingo_data.py)
+* [Vision Transformer without Finetuning Performance on Gaussian Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/training_vision_transformer_model_on_gaussian_data.py)
+* [Vision Transformer without Finetuning Performance on Flamingo Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/vision_transformer_without_finetuning_performance_on_flamingo_data.py)
+* [Vision Transformer with Finetuning Performance on Flamingo Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/vision_transformer_with_finetuning_performance_on_flamingo_data.py)
 
 
 ## Loss
-[Loss Normalization]()
+* [Loss Normalization](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/loss_normalization.py)
 
 ## Data
-[Flamingo Data]()
-[Generate Gaussian Data]()
-[Rotated Flamingo Dataset for Finetuning]()
-[Generate CMB Data]()
+* [Flamingo Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/flamingo_data.py)
+* [Generate Gaussian Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/generate_gaussian_data.py)
+* [Rotated Flamingo Dataset for Finetuning](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/rotated_flamingo_dataset_for_finetuning.py)
+* [Generate CMB Data](https://github.com/smcoulombe/Kinetic-Sunyaev-Zel-dovich-Velocity-Reconstruction-Using-Vision-Transformers/blob/main/generate_cmb_data.py)
+
+
+
+
+
