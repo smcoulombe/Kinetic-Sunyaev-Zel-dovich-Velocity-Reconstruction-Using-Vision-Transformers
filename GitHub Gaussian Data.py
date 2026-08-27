@@ -1,0 +1,176 @@
+"""
+Generate correlated (tau0, tau1, tau2, v0, v1, v2) realizations using the
+smoothed, normalized 21-spectrum covariance matrix already computed in the
+FLAMINGO notebook. Each realization is fully independent of the others
+(different random seed), so this parallelizes across CPU cores with one
+realization per worker task.
+
+Designed to be submitted as a batch job (see accompanying .sbatch script)
+rather than run interactively.
+"""
+import os
+import argparse
+import shutil
+import glob
+import re
+import numpy as np
+import healpy as hp
+import gc
+from multiprocessing import Pool
+
+DATA_DIR = "/mnt/beegfs/scoulombe"
+nside = 2048
+lmax = 3 * nside - 1
+npix = hp.nside2npix(nside)
+field_names = ["tau0", "tau1", "tau2", "v0", "v1", "v2"]
+n = len(field_names)
+n_spectra = n * (n + 1) // 2  # 21
+
+SMOOTH_WINDOW = 5  # must match the window used in the notebook
+
+N_REALIZATIONS = 64  # target total for this run -- bump this each time you grow the dataset
+
+def _real_files_for(n_realizations):
+    return {
+        name: os.path.join(
+            DATA_DIR,
+            f"realizations_{name}_nside{nside}_n{n_realizations}_norm_smooth{SMOOTH_WINDOW}.npy",
+        )
+        for name in field_names
+    }
+
+def _realization_set_complete(n_realizations):
+    return all(os.path.exists(p) for p in _real_files_for(n_realizations).values())
+
+def find_source_n(target_n):
+    """
+    Find the largest existing, COMPLETE realization set with n < target_n, so
+    this run can copy those realizations forward instead of recomputing them.
+    Seeding is deterministic (np.random.seed(i) per index), so realizations
+    0..n-1 are always identical regardless of what N_REALIZATIONS was set to
+    when they were generated -- growing the target again in the future keeps
+    finding the largest available prefix automatically, no manual bookkeeping.
+    """
+    pattern = os.path.join(DATA_DIR, f"realizations_v0_nside{nside}_n*_norm_smooth{SMOOTH_WINDOW}.npy")
+    found = []
+    for path in glob.glob(pattern):
+        m = re.search(rf"_n(\d+)_norm_smooth{SMOOTH_WINDOW}\.npy$", path)
+        if not m:
+            continue
+        n_candidate = int(m.group(1))
+        if n_candidate < target_n and _realization_set_complete(n_candidate):
+            found.append(n_candidate)
+    return max(found) if found else None
+
+REAL_FILES = _real_files_for(N_REALIZATIONS)
+CLS_PATH = os.path.join(DATA_DIR, f"cls_all_nside{nside}_lmax{lmax}_norm.npz")
+
+def moving_average(y, window):
+    """Simple centered moving average via convolution, edge-padded so the
+    output is the same length as the input (no shrinkage at the boundaries).
+    Must match the notebook's version exactly for consistency."""
+    if window <= 1:
+        return y
+    kernel = np.ones(window) / window
+    pad = window // 2
+    y_padded = np.pad(y, pad, mode="edge")
+    smoothed = np.convolve(y_padded, kernel, mode="same")
+    return smoothed[pad:pad + len(y)]
+
+
+def load_cls():
+    if not os.path.exists(CLS_PATH):
+        raise FileNotFoundError(
+            f"{CLS_PATH} not found — run the FLAMINGO notebook's normalized "
+            f"alms/cls_all cells first so this covariance is available."
+        )
+    cls_data = np.load(CLS_PATH)
+    cls_all = [cls_data[str(k)] for k in range(n_spectra)]
+    return [moving_average(c, SMOOTH_WINDOW) for c in cls_all]
+
+
+def generate_one(args):
+    """Generate one realization purely in memory and return it — no file I/O
+    happens in worker processes at all. This avoids many workers concurrently
+    calling open_memmap()/flush() on the same shared files on the network
+    filesystem, which can cause lock/metadata contention.
+    """
+    i, cls_all = args
+    np.random.seed(i)
+    # pol=False -> 6 independent spin-0 fields; new=True -> diagonal cl
+    # ordering, matching field_names = [tau0,tau1,tau2,v0,v1,v2]
+    realization = hp.synfast(cls_all, nside, lmax=lmax, pol=False, new=True)
+    realization = [m.astype(np.float32) for m in realization]
+    return i, realization
+
+
+def main(n_workers):
+    if all(os.path.exists(p) for p in REAL_FILES.values()):
+        print("Found existing realization files, skipping generation.")
+        return
+
+    source_n = find_source_n(N_REALIZATIONS)
+
+    # Write to temp filenames first; only rename to the final REAL_FILES names
+    # once every realization has been written and flushed. If the job is
+    # killed partway through, the temp files are orphaned but the final files
+    # never appear, so a rerun regenerates cleanly instead of silently
+    # treating a half-finished array as complete.
+    tmp_files = {name: path + ".tmp" for name, path in REAL_FILES.items()}
+
+    out_arrays = {
+        name: np.lib.format.open_memmap(
+            path, mode="w+", dtype=np.float32, shape=(N_REALIZATIONS, npix)
+        )
+        for name, path in tmp_files.items()
+    }
+
+    if source_n is not None:
+        source_files = _real_files_for(source_n)
+        print(f"Found existing complete realization set for n={source_n} -- copying forward instead of recomputing")
+        old_arrays = {name: np.load(path, mmap_mode="r") for name, path in source_files.items()}
+        for name in field_names:
+            out_arrays[name][:source_n] = old_arrays[name][:]
+        for arr in out_arrays.values():
+            arr.flush()
+        del old_arrays
+        gc.collect()
+        start_i = source_n
+    else:
+        print("No smaller existing realization set found -- generating all from scratch")
+        start_i = 0
+
+    cls_all = load_cls()
+    new_indices = range(start_i, N_REALIZATIONS)
+    tasks = [(i, cls_all) for i in new_indices]
+
+    print(f"Generating {len(tasks)} new realizations ({start_i}..{N_REALIZATIONS - 1}) "
+          f"using {n_workers} worker processes...")
+    with Pool(n_workers) as pool:
+        for i, realization in pool.imap_unordered(generate_one, tasks):
+            for name, field_map in zip(field_names, realization):
+                out_arrays[name][i] = field_map
+            print(f"Realization {i} done", flush=True)
+            del realization
+            gc.collect()
+
+    for arr in out_arrays.values():
+        arr.flush()
+    del out_arrays
+    gc.collect()
+
+    for name, tmp_path in tmp_files.items():
+        shutil.move(tmp_path, REAL_FILES[name])
+
+    print("Saved:", *REAL_FILES.values(), sep="\n  ")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--n_workers", type=int,
+        default=int(os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 4)),
+        help="Number of parallel worker processes (defaults to SLURM_CPUS_PER_TASK, or CPU count)",
+    )
+    args = parser.parse_args()
+    main(args.n_workers)

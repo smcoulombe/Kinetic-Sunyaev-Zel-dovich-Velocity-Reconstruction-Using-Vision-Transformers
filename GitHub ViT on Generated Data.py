@@ -1,0 +1,419 @@
+"""
+SLURM batch job: heavy-compute half of the ViT analysis -- GENERATED DATA,
+STAGE-24 CHECKPOINT, comparison-format outputs.
+
+This is a modified copy of vit_compute_job.py. Changes from that script:
+  1. STAGE_TO_LOAD = 24 (was 25) -- loads the end-of-stage-24 checkpoint.
+  2. Test data is UNCHANGED: still the synthetic held-out realization
+     (test_realization_*_seed{TEST_SEED}.npy), the SAME files the
+     generated-data QE script (qe_binned_standalone_l10_5000.py) uses --
+     so QE and ViT are compared on identical input data.
+  3. Output format changed to match the QE scripts: cl_true, cl_vit
+     (predicted Cl), cl_cross, and the reconstructed v_hat map are all
+     bundled into ONE file (RESULTS_FILE), instead of the original
+     script's split between RESULTS_FILE (spectra/scalars only) and a
+     separate vit_vhat_maps_*.npz file for the maps. mse, r2, and the
+     loss-function breakdown are also kept in the same file since they're
+     already computed in the same loop and cost nothing extra to retain.
+  4. RESULTS_FILE now lives under final_vit_base_generated/ (new
+     directory), with a name that encodes the checkpoint stage, so this
+     run's outputs never collide with the stage-25 run's outputs.
+
+No l-filtering is applied anywhere in this script (per instruction): all
+Cl arrays span the full l=0..LMAX range, VIT_LMIN_FILTER=1 (only the l=0
+monopole excluded from the printed <r^2> summary), no upper l cutoff.
+
+Everything else -- model architecture, loss functions, patch/geometry
+helpers, eps list, serial loading style -- is IDENTICAL to
+vit_compute_job.py.
+
+Run via: sbatch submit_vit_base_generated.sh
+(which just calls: python vit_compute_job_base_generated.py)
+
+ASSUMPTIONS -- same as the original script, check before trusting:
+  - SNAPSHOT_TAG = "binned_finegrained_v2_bigmodel_n64_v1" (confirmed default,
+    not overridden for this training run).
+  - N_REALIZATIONS_USED = 64 -> TEST_SEED = 64. Change if your training run
+    overrode N_REALIZATIONS via env var.
+  - Checkpoint = end-of-stage-24 snapshot: model_weights_{SNAPSHOT_TAG}_stage24_end.pt
+  - Model architecture matches training script exactly at that checkpoint:
+    SimpleViT(in_ch=4, out_ch=3, embed_dim=128, depth=5, n_heads=4,
+    mlp_ratio=4, patch_size=8), eps_max=EPS_MAX=1.5 (max of training EPS_LIST).
+"""
+
+import os
+import gc
+import numpy as np
+import healpy as hp
+import torch
+import torch.nn as nn
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
+# ==== constants -- must match the ViT training script ====
+SNAPSHOT_TAG = "binned_finegrained_v2_bigmodel_n64_v1"   # confirmed: not overridden
+STAGE_TO_LOAD = 24   # CHANGED from 25 -- this run loads the end-of-stage-24 checkpoint
+
+N_REALIZATIONS_USED = 64   # <-- change this if the training run overrode N_REALIZATIONS
+TEST_SEED = N_REALIZATIONS_USED
+
+NSIDE_MAP   = 2048
+NSIDE_PATCH = 256
+LMAX        = 3 * NSIDE_MAP - 1
+BIN_NAMES   = ["0", "1", "2"]
+n_bins      = len(BIN_NAMES)
+
+EPS_MAX = 1.5   # max(EPS_LIST) in the training script -- must match training exactly
+VIT_EPS_LIST = [0.0, 1.0]   # eps values to reconstruct + score at
+VIT_LMIN_FILTER = 1   # UNCHANGED: no l-filtering, only l=0 monopole excluded from <r^2> summary
+
+DATA_DIR = "/mnt/beegfs/scoulombe"   # <-- update if different
+OUT_DIR = os.path.join(DATA_DIR, "final_vit_base_generated")
+
+CHECKPOINT_FILE = os.path.join(DATA_DIR, f"model_weights_{SNAPSHOT_TAG}_stage{STAGE_TO_LOAD}_end.pt")
+LOSS_SCALE_FILE = os.path.join(DATA_DIR, "binned_loss_scale.npz")
+RESULTS_FILE = os.path.join(OUT_DIR, f"vit_results_base_generated_stage{STAGE_TO_LOAD}_{SNAPSHOT_TAG}.npz")
+
+TEST_FILES = {
+    name: os.path.join(DATA_DIR, f"test_realization_{name}_nside{NSIDE_MAP}_binned_seed{TEST_SEED}.npy")
+    for name in ["v0", "v1", "v2", "tau0", "tau1", "tau2", "T", "cmbnoise"]
+}
+
+assert os.path.exists(CHECKPOINT_FILE), (
+    f"{CHECKPOINT_FILE} not found -- check SNAPSHOT_TAG / STAGE_TO_LOAD."
+)
+assert os.path.exists(LOSS_SCALE_FILE), f"{LOSS_SCALE_FILE} not found."
+for name, p in TEST_FILES.items():
+    assert os.path.exists(p), (
+        f"{p} not found -- check N_REALIZATIONS_USED (currently {N_REALIZATIONS_USED}, "
+        f"giving TEST_SEED={TEST_SEED})."
+    )
+
+_scales = np.load(LOSS_SCALE_FILE)
+weight_pixel    = float(_scales["weight_pixel"])
+weight_patch    = float(_scales["weight_patch"])
+weight_spectral = float(_scales["weight_spectral"])
+N_SPEC_BINS   = int(_scales["n_spec_bins"])
+SPEC_LOSS_EPS = float(_scales["spec_loss_eps"])
+
+##=====================================
+##  HEALPIX GEOMETRY  (identical to training script)
+##=====================================
+def precompute_face_indices(nside):
+    npix = hp.nside2npix(nside)
+    ipix = np.arange(npix, dtype=np.int32)
+    x, y, f = hp.pix2xyf(nside, ipix, nest=True)
+    face_idx = {}
+    for face_id in range(12):
+        mask = f == face_id
+        face_idx[face_id] = (ipix[mask].astype(np.int32), x[mask].astype(np.int32), y[mask].astype(np.int32))
+    return face_idx
+
+FACE_IDX = precompute_face_indices(NSIDE_MAP)
+
+def get_face_2d(map_nest, nside, face_id, face_idx=FACE_IDX):
+    ipix_f, x_f, y_f = face_idx[face_id]
+    face_img = np.full((nside, nside), np.nan, dtype=map_nest.dtype)
+    face_img[y_f, x_f] = map_nest[ipix_f]
+    assert not np.isnan(face_img).any(), f"Face {face_id} has unfilled pixels — reshape failed"
+    return face_img
+
+def extract_all_patches_from_map(map_nest, nside_map, nside_patch, face_idx=FACE_IDX):
+    n_per_side = nside_map // nside_patch
+    n_patches = 12 * n_per_side * n_per_side
+    out = np.empty((n_patches, nside_patch, nside_patch), dtype=map_nest.dtype)
+    idx = 0
+    for face_id in range(12):
+        face_img = get_face_2d(map_nest, nside_map, face_id, face_idx)
+        for pr in range(n_per_side):
+            for pc in range(n_per_side):
+                out[idx] = face_img[pr*nside_patch:(pr+1)*nside_patch,
+                                     pc*nside_patch:(pc+1)*nside_patch]
+                idx += 1
+    return out
+
+_PATCH_PIXEL_IDX_CACHE = {}
+
+def precompute_patch_pixel_indices(nside_map, nside_patch, face_idx=FACE_IDX):
+    n_per_side = nside_map // nside_patch
+    n_patches = 12 * n_per_side * n_per_side
+    idx_out = np.empty((n_patches, nside_patch, nside_patch), dtype=np.int64)
+    patch_i = 0
+    for face_id in range(12):
+        ipix_f, x_f, y_f = face_idx[face_id]
+        face_grid = np.full((nside_map, nside_map), -1, dtype=np.int64)
+        face_grid[y_f, x_f] = ipix_f
+        assert not (face_grid == -1).any(), f"Face {face_id} has unfilled pixels — index precompute failed"
+        for pr in range(n_per_side):
+            for pc in range(n_per_side):
+                idx_out[patch_i] = face_grid[pr*nside_patch:(pr+1)*nside_patch,
+                                              pc*nside_patch:(pc+1)*nside_patch]
+                patch_i += 1
+    return idx_out
+
+def reassemble_from_stack(patch_stack, nside_map, nside_patch):
+    key = (nside_map, nside_patch)
+    if key not in _PATCH_PIXEL_IDX_CACHE:
+        _PATCH_PIXEL_IDX_CACHE[key] = precompute_patch_pixel_indices(nside_map, nside_patch)
+    pix_idx = _PATCH_PIXEL_IDX_CACHE[key]
+    assert patch_stack.shape == pix_idx.shape, (
+        f"patch_stack shape {patch_stack.shape} does not match expected {pix_idx.shape}"
+    )
+    out = np.full(hp.nside2npix(nside_map), np.nan, dtype=patch_stack.dtype)
+    out[pix_idx.ravel()] = patch_stack.ravel()
+    assert not np.isnan(out).any(), "Some pixels were not filled during reassembly!"
+    return out
+
+def reassemble_channels_from_stack(patch_stack_multi, nside_map, nside_patch):
+    n_channels = patch_stack_multi.shape[1]
+    return [reassemble_from_stack(patch_stack_multi[:, c], nside_map, nside_patch)
+            for c in range(n_channels)]
+
+def reconstruct_full_maps_multi(model, Tnoise_map_nest, tau_maps_nest, nside_map, nside_patch, eps, batch_size=256):
+    Tnoise_stack = extract_all_patches_from_map(Tnoise_map_nest, nside_map, nside_patch)
+    tau_stacks = [extract_all_patches_from_map(t, nside_map, nside_patch) for t in tau_maps_nest]
+
+    n_patches = Tnoise_stack.shape[0]
+    preds = np.empty((n_patches, n_bins, nside_patch, nside_patch), dtype=np.float32)
+
+    with torch.no_grad():
+        for start in range(0, n_patches, batch_size):
+            end = min(start + batch_size, n_patches)
+            inp = np.stack([Tnoise_stack[start:end]] + [ts[start:end] for ts in tau_stacks], axis=1)
+            inp_t = torch.tensor(inp, dtype=torch.float32).to(device)
+            eps_t = torch.full((inp_t.shape[0],), eps, dtype=torch.float32, device=device)
+            pred = model(inp_t, eps_t).cpu().numpy()
+            preds[start:end] = pred
+            del inp, inp_t, eps_t, pred
+
+    del Tnoise_stack, tau_stacks
+    gc.collect()
+    return reassemble_channels_from_stack(preds, nside_map, nside_patch)
+
+##=====================================
+##  MODEL  (identical architecture to training script)
+##=====================================
+class SimpleViT(nn.Module):
+    def __init__(self, img_size, patch_size=8, in_ch=4, out_ch=3,
+                 embed_dim=64, depth=4, n_heads=4, mlp_ratio=4, eps_max=EPS_MAX):
+        super().__init__()
+        assert img_size % patch_size == 0
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.grid = img_size // patch_size
+        self.n_tokens = self.grid * self.grid
+        self.out_ch = out_ch
+        self.eps_max = eps_max
+        self.patch_embed = nn.Conv2d(in_ch, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.pos_embed = nn.Parameter(torch.randn(1, self.n_tokens, embed_dim) * 0.02)
+        self.eps_embed = nn.Sequential(
+            nn.Linear(1, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_heads, dim_feedforward=embed_dim * mlp_ratio,
+            batch_first=True, activation='gelu'
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.norm = nn.LayerNorm(embed_dim)
+        self.head = nn.Linear(embed_dim, out_ch * patch_size * patch_size)
+
+    def forward(self, x, eps):
+        B, C, H, W = x.shape
+        tokens = self.patch_embed(x)
+        tokens = tokens.flatten(2).transpose(1, 2)
+        tokens = tokens + self.pos_embed
+
+        eps_norm = (eps.float() / self.eps_max).view(B, 1)
+        eps_emb = self.eps_embed(eps_norm)
+        tokens = tokens + eps_emb.unsqueeze(1)
+
+        tokens = self.encoder(tokens)
+        tokens = self.norm(tokens)
+        out = self.head(tokens)
+        p = self.patch_size
+        out = out.reshape(B, self.grid, self.grid, self.out_ch, p, p)
+        out = out.permute(0, 3, 1, 4, 2, 5)
+        out = out.reshape(B, self.out_ch, self.grid * p, self.grid * p)
+        return out
+
+model = SimpleViT(img_size=NSIDE_PATCH, in_ch=4, out_ch=3, eps_max=EPS_MAX,
+                   embed_dim=128, depth=5).to(device)
+model.load_state_dict(torch.load(CHECKPOINT_FILE, map_location=device))
+model.eval()
+print(f"Loaded stage-{STAGE_TO_LOAD}-end checkpoint from {CHECKPOINT_FILE}")
+
+##=====================================
+##  LOAD ViT's OWN TEST REALIZATION (same synthetic generated data the QE
+##  generated-data script uses)
+##=====================================
+v_true_ring   = {b: np.load(TEST_FILES[f"v{b}"]).astype(np.float32) for b in BIN_NAMES}
+tau_ring      = {b: np.load(TEST_FILES[f"tau{b}"]).astype(np.float32) for b in BIN_NAMES}
+noise_ring    = np.load(TEST_FILES["cmbnoise"]).astype(np.float32)
+T_ring        = np.load(TEST_FILES["T"]).astype(np.float32)
+
+tau_nest = {b: hp.reorder(tau_ring[b], r2n=True) for b in BIN_NAMES}
+tau_maps_nest_list = [tau_nest[b] for b in BIN_NAMES]
+del tau_ring
+gc.collect()
+
+##=====================================
+##  LOSS FUNCTIONS  (identical to training script)
+##=====================================
+_RADIAL_BIN_CACHE = {}
+
+def get_radial_bins(patch_size, n_bins_, torch_device):
+    key = (patch_size, n_bins_, str(torch_device))
+    if key in _RADIAL_BIN_CACHE:
+        return _RADIAL_BIN_CACHE[key]
+    freqs_y = torch.fft.fftfreq(patch_size)
+    freqs_x = torch.fft.rfftfreq(patch_size)
+    ky, kx = torch.meshgrid(freqs_y, freqs_x, indexing='ij')
+    k = torch.sqrt(kx**2 + ky**2)
+    k_flat = k.flatten()
+    nonzero = k_flat[k_flat > 0]
+    kmin = nonzero.min()
+    kmax = k_flat.max()
+    bin_edges = torch.logspace(torch.log10(kmin), torch.log10(kmax), n_bins_ + 1)
+    bin_idx = torch.bucketize(k_flat, bin_edges) - 1
+    bin_idx = bin_idx.clamp(0, n_bins_ - 1).long().to(torch_device)
+    _RADIAL_BIN_CACHE[key] = bin_idx
+    return bin_idx
+
+def radial_power_spectrum(patch_batch, n_bins_=N_SPEC_BINS):
+    N, H, W = patch_batch.shape
+    fft = torch.fft.rfft2(patch_batch)
+    power = fft.real**2 + fft.imag**2
+    bin_idx = get_radial_bins(H, n_bins_, patch_batch.device)
+    power_flat = power.reshape(N, -1)
+    binned = torch.zeros(N, n_bins_, device=patch_batch.device, dtype=power.dtype)
+    binned.index_add_(1, bin_idx, power_flat)
+    counts = torch.zeros(n_bins_, device=patch_batch.device, dtype=power.dtype)
+    counts.index_add_(0, bin_idx, torch.ones_like(bin_idx, dtype=power.dtype))
+    counts = counts.clamp(min=1.0)
+    binned = binned / counts.unsqueeze(0)
+    return binned
+
+def pixel_loss_fn(pred, target):
+    return torch.mean((pred - target) ** 2)
+
+def patch_loss_fn(pred, target):
+    pred_mean   = pred.mean(dim=(2, 3))
+    target_mean = target.mean(dim=(2, 3))
+    return torch.mean((pred_mean - target_mean) ** 2)
+
+def spectral_loss_fn(pred, target, n_bins_=N_SPEC_BINS, eps=SPEC_LOSS_EPS):
+    B, C, H, W = pred.shape
+    pred_flat   = pred.reshape(B * C, H, W)
+    target_flat = target.reshape(B * C, H, W)
+    P_pred = radial_power_spectrum(pred_flat, n_bins_=n_bins_)
+    P_true = radial_power_spectrum(target_flat, n_bins_=n_bins_)
+    log_pred = torch.log(P_pred + eps)
+    log_true = torch.log(P_true + eps)
+    return torch.mean((log_pred - log_true) ** 2)
+
+def combined_loss_fn(pred, target):
+    l_pixel = pixel_loss_fn(pred, target)
+    l_patch = patch_loss_fn(pred, target)
+    l_spectral = spectral_loss_fn(pred, target)
+    total = weight_pixel * l_pixel + weight_patch * l_patch + weight_spectral * l_spectral
+    return total, l_pixel.detach(), l_patch.detach(), l_spectral.detach()
+
+def maps_to_patch_tensor(maps_by_bin_ring):
+    per_bin_patches = []
+    for b in BIN_NAMES:
+        map_nest = hp.reorder(maps_by_bin_ring[b], r2n=True)
+        patches = extract_all_patches_from_map(map_nest, NSIDE_MAP, NSIDE_PATCH)
+        per_bin_patches.append(patches)
+    stacked = np.stack(per_bin_patches, axis=1)
+    return torch.tensor(stacked, dtype=torch.float32, device=device)
+
+##=====================================
+##  MAIN COMPUTE LOOP  -- one eps at a time, freeing memory between
+##=====================================
+ell = np.arange(LMAX + 1)
+
+cl_true = {b: hp.anafast(v_true_ring[b], lmax=LMAX) for b in BIN_NAMES}
+
+results = {
+    "ell": ell,
+    "VIT_LMIN_FILTER": VIT_LMIN_FILTER,
+    "VIT_EPS_LIST": np.array(VIT_EPS_LIST),
+    "STAGE_TO_LOAD": STAGE_TO_LOAD,
+    "SNAPSHOT_TAG": SNAPSHOT_TAG,
+    "TEST_SEED": TEST_SEED,
+}
+for b in BIN_NAMES:
+    results[f"cl_true_bin{b}"] = cl_true[b]
+
+for eps in VIT_EPS_LIST:
+    print(f"\n--- Processing eps={eps} ---")
+    Tnoise_ring = (T_ring + eps * noise_ring).astype(np.float32)
+    Tnoise_nest = hp.reorder(Tnoise_ring, r2n=True)
+    del Tnoise_ring
+
+    recon_nests_list = reconstruct_full_maps_multi(
+        model, Tnoise_nest, tau_maps_nest_list, NSIDE_MAP, NSIDE_PATCH, eps=eps
+    )
+    del Tnoise_nest
+    gc.collect()
+
+    vhat_ring_this_eps = {}
+    for bi, b in enumerate(BIN_NAMES):
+        vhat_ring_this_eps[b] = hp.reorder(recon_nests_list[bi], n2r=True)
+    del recon_nests_list
+    gc.collect()
+    print(f"Reconstructed full-sky vhat maps for eps={eps}")
+
+    # ---- Cl-space metrics ----
+    for b in BIN_NAMES:
+        cl_vit_b   = hp.anafast(vhat_ring_this_eps[b], lmax=LMAX)
+        cl_cross_b = hp.anafast(v_true_ring[b], vhat_ring_this_eps[b], lmax=LMAX)
+        mse_b      = float(np.mean((v_true_ring[b] - vhat_ring_this_eps[b]) ** 2))
+        r2_b       = (cl_cross_b ** 2) / (cl_true[b] * cl_vit_b)
+
+        results[f"cl_vit_bin{b}_eps{eps}"]   = cl_vit_b
+        results[f"cl_cross_bin{b}_eps{eps}"] = cl_cross_b
+        results[f"mse_bin{b}_eps{eps}"]      = mse_b
+        results[f"r2_bin{b}_eps{eps}"]       = r2_b
+        # CHANGED: v_hat map bundled directly into results (and therefore
+        # into the single RESULTS_FILE savez below), matching the QE
+        # scripts' save format, instead of being collected into a separate
+        # vhat_ring_to_save dict written to its own file.
+        results[f"v_hat_bin{b}_eps{eps}"]    = vhat_ring_this_eps[b].astype(np.float32)
+
+        valid_mask = ell >= VIT_LMIN_FILTER
+        print(f"  bin v{b}: <r^2> = {np.mean(r2_b[valid_mask]):.4f}   MSE = {mse_b:.3e}")
+
+    # ---- Loss-function scoring (patch-space, matches training loss exactly) ----
+    target_by_bin = {b: v_true_ring[b] for b in BIN_NAMES}
+    target_t = maps_to_patch_tensor(target_by_bin)
+    pred_t   = maps_to_patch_tensor(vhat_ring_this_eps)
+
+    total, l_pixel, l_patch, l_spectral = combined_loss_fn(pred_t, target_t)
+    results[f"loss_total_eps{eps}"]              = total.item()
+    results[f"loss_pixel_raw_eps{eps}"]          = l_pixel.item()
+    results[f"loss_patch_raw_eps{eps}"]          = l_patch.item()
+    results[f"loss_spectral_raw_eps{eps}"]       = l_spectral.item()
+    results[f"loss_pixel_weighted_eps{eps}"]     = weight_pixel * l_pixel.item()
+    results[f"loss_patch_weighted_eps{eps}"]     = weight_patch * l_patch.item()
+    results[f"loss_spectral_weighted_eps{eps}"]  = weight_spectral * l_spectral.item()
+    print(f"  loss_total(weighted) = {total.item():.6e}")
+
+    del target_t, pred_t
+    torch.cuda.empty_cache() if device.type == "cuda" else None
+
+    del vhat_ring_this_eps
+    gc.collect()
+
+results["weight_pixel"] = weight_pixel
+results["weight_patch"] = weight_patch
+results["weight_spectral"] = weight_spectral
+
+os.makedirs(OUT_DIR, exist_ok=True)
+np.savez(RESULTS_FILE, **results)
+print(f"\nSaved all results (cl_true, cl_vit, cl_cross, v_hat) to {RESULTS_FILE}")
+
+print("Done.")
